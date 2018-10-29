@@ -28,6 +28,7 @@ package mgo
 
 import (
 	"errors"
+	"math/rand"
 	"net"
 	"sort"
 	"sync"
@@ -52,6 +53,7 @@ func initCoarseTime() {
 	coarseTimeOnce.Do(func() {
 		coarseTime = newcoarseTimeProvider(25 * time.Millisecond)
 	})
+	rand.Seed(time.Now().UTC().UnixNano())
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +579,11 @@ func (servers *mongoServers) BestFit(mode Mode, serverTags []bson.D) *mongoServe
 		if best == nil {
 			best = next
 			best.RLock()
+			// Switch to fair selection algorithm if servers are Mongos
+			if best.info.Mongos {
+				best.RUnlock()
+				return servers.mongosFairSelection()
+			}
 			if len(serverTags) != 0 && !next.info.Mongos && !best.hasTags(serverTags) {
 				best.RUnlock()
 				best = nil
@@ -611,6 +618,37 @@ func (servers *mongoServers) BestFit(mode Mode, serverTags []bson.D) *mongoServe
 		best.RUnlock()
 	}
 	return best
+}
+
+var localThreshold = 15 * time.Millisecond
+
+// mongos fair selection will randomly choose a server within the latency
+// window defined by localThreshold
+func (servers *mongoServers) mongosFairSelection() *mongoServer {
+	if len(servers.slice) == 1 {
+		return servers.slice[0]
+	}
+	// Lock all servers for consistent point-in-time comparison.
+	for _, v := range servers.slice {
+		v.RLock()
+	}
+	minPing := servers.slice[0].pingValue
+	for _, v := range servers.slice[1:] {
+		if v.pingValue < minPing {
+			minPing = v.pingValue
+		}
+	}
+	// Get a list of servers in the latency window
+	window := make([]*mongoServer, 0, len(servers.slice))
+	for _, v := range servers.slice {
+		if v.pingValue-minPing <= localThreshold {
+			window = append(window, v)
+		}
+	}
+	for _, v := range servers.slice {
+		v.RUnlock()
+	}
+	return window[rand.Intn(len(window))]
 }
 
 func absDuration(d time.Duration) time.Duration {
